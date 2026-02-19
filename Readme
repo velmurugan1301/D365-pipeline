@@ -1,0 +1,313 @@
+🟢 STEP 1 — Checkout
+- checkout: self
+
+What happens internally?
+
+Azure DevOps Agent:
+
+Connects to your Git repo
+
+Downloads source into:
+
+C:\DynamicsSDK\VSOAgent\_work\<buildID>\s
+
+
+Inside that folder:
+
+s\
+ └── Metadata\
+      ├── TVS\
+      └── AT_Customization\
+
+
+Nothing Dynamics-specific happens yet.
+Just Git clone into the agent workspace.
+
+🟢 STEP 2 — Sync Custom Metadata
+
+Your script:
+
+robocopy "$gitMeta\$module" "$aosMeta\$module"
+
+What happens here?
+
+You copy:
+
+Git metadata
+→
+AOS PackagesLocalDirectory
+
+
+So this:
+
+C:\DynamicsSDK\VSOAgent\_work\<id>\s\Metadata\TVS
+
+
+Gets copied to:
+
+K:\AosService\PackagesLocalDirectory\TVS
+
+
+Why is this important?
+
+Because MSBuild does NOT compile from Git folder.
+
+It compiles from:
+
+PackagesLocalDirectory
+
+
+That is the real metadata store used by the build engine.
+
+So after this step:
+
+✔ AOS metadata store is updated
+✔ Your custom models now exist in the live metadata path
+
+🟢 STEP 3 — Compile Custom Modules
+
+This line is the heart:
+
+& $msbuild "$sdk\Metadata\BuildMetadata.proj"
+
+🔥 What really happens here?
+
+You are invoking:
+
+BuildMetadata.proj
+
+
+That file loads:
+
+Microsoft.Dynamics.AX.Application.Build.targets
+Microsoft.Dynamics.AX.Build.Tasks.dll
+
+
+These contain the X++ compiler logic.
+
+🔧 What MSBuild Does Internally
+
+When you pass:
+
+/p:ModuleToBuild="TVS"
+/p:ModelsToBuild="TVS"
+
+
+MSBuild:
+
+Loads metadata from:
+
+K:\AosService\PackagesLocalDirectory
+
+
+Resolves model dependencies
+
+Loads X++ compiler engine
+
+Compiles:
+
+Tables
+
+Classes
+
+Forms
+
+Views
+
+Security artifacts
+
+Produces output in:
+
+K:\AosService\PackagesLocalDirectory\Bin
+
+
+Inside that you get:
+
+TVS\
+  bin\
+    TVS.dll
+    TVS.pdb
+
+
+So compilation result = X++ → .NET assemblies.
+
+That’s what actually happens.
+
+You are not building C# — you are invoking the X++ compiler wrapped inside MSBuild.
+
+🟢 STEP 4 — Prepare Clean Bin Folder
+
+You do:
+
+robocopy "$aosMeta\$module" "$cleanBin\$module"
+
+
+This simulates what TFS does automatically.
+
+Why?
+
+Because TFS normally builds into:
+
+_work\2\Bin
+
+
+GeneratePackage.ps1 expects a clean bin structure.
+
+So you manually create:
+
+_work\<id>\b\Bin\
+   ├── TVS
+   └── AT_Customization
+
+
+Each folder contains:
+
+bin\
+
+Reports\
+
+Resources\
+
+descriptor files
+
+This is important.
+GeneratePackage.ps1 scans this structure to determine what to package.
+
+🟢 STEP 5 — GeneratePackage.ps1
+
+Now the magic.
+
+You run:
+
+GeneratePackage.ps1
+
+
+This is the exact same script your TFS pipeline used.
+
+🔥 What Happens Inside GeneratePackage.ps1
+Phase 1 — Find Packages
+
+It scans:
+
+BuildBinPath
+
+
+Finds:
+
+TVS
+AT_Customization
+
+Phase 2 — Create Runtime Packages (.nupkg)
+
+For each module:
+
+It loads:
+
+CreatePackage.psm1
+
+
+Then runs:
+
+New-XppRuntimePackage
+
+
+This:
+
+Reads module descriptor
+
+Resolves dependencies
+
+Creates .nuspec file
+
+Uses:
+
+C:\DynamicsTools\7za.exe
+
+
+to zip runtime files
+
+Uses:
+
+nuget.exe pack
+
+
+to create:
+
+dynamicsax-tvs.7.0.xxxxx.nupkg
+
+
+So internally:
+
+7zip compresses runtime
+
+NuGet builds package
+
+Dependencies added automatically
+
+Phase 3 — Create Combined Runtime
+
+After individual packages are created:
+
+Script loads:
+
+BaseMetadataDeployablePackage.zip
+
+
+Then merges:
+
+Your runtime packages
++
+Base metadata package
+
+
+Into:
+
+AXDeployableRuntime_7.0.xxxxx.zip
+
+
+This is the file you deploy to LCS.
+
+Phase 4 — Create Model Source Package
+
+Script runs:
+
+ModelUtil.exe -export
+
+
+Exports:
+
+TVS.axmodel
+AT_Customization.axmodel
+
+
+Then zips into:
+
+AXModelSource_7.0.xxxxx.zip
+
+
+This is source backup package.
+
+🟢 STEP 6 — Publish Artifact
+
+Azure DevOps:
+
+Copies everything from:
+
+$(Build.ArtifactStagingDirectory)
+
+
+Into:
+
+Pipeline artifact storage.
+
+Now it's downloadable.
+
+📦 So End Result
+
+Your pipeline produces:
+
+AXDeployableRuntime_7.0.xxxxx.zip
+AXModelSource_7.0.xxxxx.zip
+
+
+Exactly like TFS.
