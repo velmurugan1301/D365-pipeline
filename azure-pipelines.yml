@@ -1,0 +1,166 @@
+trigger:
+- main
+
+name: 7.0.$(Date:yyyyMMdd).$(Rev:r)
+
+pool:
+  name: 'Default'
+
+variables:
+  Modules: |
+    TVS
+    AT_Customization
+
+steps:
+
+# ------------------------------------------------------------
+# Checkout
+# ------------------------------------------------------------
+- checkout: self
+  clean: true
+
+
+# ------------------------------------------------------------
+# Sync Metadata
+# ------------------------------------------------------------
+- task: PowerShell@2
+  displayName: 'Sync Custom Metadata'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $ErrorActionPreference = "Stop"
+
+      $reg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Dynamics\AX\7.0\SDK"
+      $aosMeta = $reg.MetadataPath
+      $gitMeta = "$(Build.SourcesDirectory)\Metadata"
+
+      $modules = "$(Modules)".Split("`n") | Where-Object { $_.Trim() -ne "" }
+
+      foreach ($module in $modules) {
+          $module = $module.Trim()
+
+          Write-Host "Syncing $module"
+
+          robocopy `
+            "$gitMeta\$module" `
+            "$aosMeta\$module" `
+            /E /XO /R:3 /W:5 `
+            /XD bin `
+            /XF *.delete *.dll *.runtime *.netmodule *.pdb *.xref
+
+          if ($LASTEXITCODE -ge 8) { throw "RoboCopy failed for $module" }
+
+          $global:LASTEXITCODE = 0
+      }
+
+
+# ------------------------------------------------------------
+# Compile Custom Modules
+# ------------------------------------------------------------
+- task: PowerShell@2
+  displayName: 'Compile Custom Modules'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $ErrorActionPreference = "Stop"
+
+      $reg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Dynamics\AX\7.0\SDK"
+      $sdk  = $reg.DynamicsSDK
+      $bin  = $reg.BinariesPath
+      $meta = $reg.MetadataPath
+      $pkg  = $reg.PackagesPath
+
+      $msbuild = "C:\Program Files\Microsoft Visual Studio\2022\Professional\MSBuild\Current\Bin\MSBuild.exe"
+
+      $modules = "$(Modules)".Split("`n") | Where-Object { $_.Trim() -ne "" }
+
+      foreach ($module in $modules) {
+          $module = $module.Trim()
+
+          Write-Host "Compiling $module"
+
+          & $msbuild "$sdk\Metadata\BuildMetadata.proj" `
+              /p:DynamicsSDK="$sdk" `
+              /p:FrameworkDirectory="$bin" `
+              /p:MetadataDirectory="$meta" `
+              /p:ReferenceFolder="$pkg" `
+              /p:ModuleToBuild="$module" `
+              /p:ModelsToBuild="$module"
+
+          if ($LASTEXITCODE -ne 0) { throw "$module compilation failed" }
+      }
+
+
+# ------------------------------------------------------------
+# Prepare Clean Bin Folder (Like TFS _work\2\Bin)
+# ------------------------------------------------------------
+- task: PowerShell@2
+  displayName: 'Prepare Clean Bin Folder'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $ErrorActionPreference = "Stop"
+
+      $reg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Dynamics\AX\7.0\SDK"
+      $aosMeta = $reg.MetadataPath
+
+      $cleanBin = "$(Build.BinariesDirectory)\Bin"
+
+      if (Test-Path $cleanBin) {
+          Remove-Item $cleanBin -Recurse -Force
+      }
+
+      New-Item -ItemType Directory -Path $cleanBin | Out-Null
+
+      $modules = "$(Modules)".Split("`n") | Where-Object { $_.Trim() -ne "" }
+
+      foreach ($module in $modules) {
+          $module = $module.Trim()
+
+          Write-Host "Copying compiled output for $module"
+
+          robocopy `
+            "$aosMeta\$module" `
+            "$cleanBin\$module" `
+            /E
+
+          if ($LASTEXITCODE -ge 8) { throw "Failed copying $module" }
+
+          $global:LASTEXITCODE = 0
+      }
+
+
+# ------------------------------------------------------------
+# Generate Deployable Package (TFS-Style)
+# ------------------------------------------------------------
+- task: PowerShell@2
+  displayName: 'Generate Packages'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $ErrorActionPreference = "Stop"
+
+      $reg = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Dynamics\AX\7.0\SDK"
+      $sdk = $reg.DynamicsSDK
+
+      & "$sdk\GeneratePackage.ps1" `
+        -BuildPackagePath "$(Build.ArtifactStagingDirectory)" `
+        -BuildBinPath "$(Build.BinariesDirectory)\Bin" `
+        -BuildMetadataPath "$(Build.SourcesDirectory)\Metadata" `
+        -BuildVersion "$(Build.BuildNumber)" `
+        -IncludeBinaries `
+        -ExclusionList ""
+
+      if ($LASTEXITCODE -ne 0) {
+          throw "Package generation failed"
+      }
+
+
+# ------------------------------------------------------------
+# Publish Artifact
+# ------------------------------------------------------------
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish AX Deployable Runtime'
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+    ArtifactName: 'AXDeployableRuntime'
